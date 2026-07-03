@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <string.h>
 
 #if TARGET_OS_SIMULATOR
 
@@ -15,11 +16,40 @@ static BOOL gConnected = NO;
 static BOOL gReconnectDisabled = NO;
 static NSString *gPendingDisconnectReason;
 static dispatch_source_t gReconnectTimer;
+static uint64_t gNotificationReadCount = 0;
+static uint64_t gNotificationReadBytes = 0;
+static CFAbsoluteTime gLastNotificationReadLog = 0;
 
 static void cbs_cancel_reconnect_timer(void);
 static void cbs_schedule_reconnect(void);
 static void cbs_handle_disconnect(int fd);
 static void cbs_start_reader(int fd);
+
+static BOOL cbs_trace_notifications_enabled(void) {
+    static BOOL enabled = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *env = getenv("IMPOSSIBLE_TRACE_NOTIFICATIONS");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ||
+                  access("/tmp/impossible-trace-notifications", F_OK) == 0;
+    });
+    return enabled;
+}
+
+static void cbs_trace_notification_read(NSUInteger bytes) {
+    if (!cbs_trace_notifications_enabled()) {
+        return;
+    }
+    gNotificationReadCount += 1;
+    gNotificationReadBytes += (uint64_t)bytes;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gNotificationReadCount == 1 || now - gLastNotificationReadLog >= 1.0) {
+        gLastNotificationReadLog = now;
+        NSLog(@"ImpossiBLE: notification_trace stage=client_read count=%llu bytes=%llu",
+              gNotificationReadCount,
+              gNotificationReadBytes);
+    }
+}
 
 static int cbs_find_newline(NSData *data) {
     const uint8_t *bytes = data.bytes;
@@ -39,8 +69,13 @@ static void cbs_handle_line(NSData *line) {
     id obj = [NSJSONSerialization JSONObjectWithData:line options:0 error:&error];
     if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *msg = (NSDictionary *)obj;
-        NSLog(@"ImpossiBLE: recv type=%@", msg[@"type"]);
-        if ([msg[@"type"] isEqualToString:@"connectionRejected"] &&
+        NSString *type = msg[@"type"];
+        if ([type isEqualToString:@"didUpdateValue"]) {
+            cbs_trace_notification_read(line.length);
+        } else {
+            NSLog(@"ImpossiBLE: recv type=%@", type);
+        }
+        if ([type isEqualToString:@"connectionRejected"] &&
             [msg[@"code"] isEqualToString:@"clientBusy"]) {
             gReconnectDisabled = YES;
             gPendingDisconnectReason = msg[@"message"] ?: @"provider rejected this process as an additional client";

@@ -23,6 +23,7 @@ let package = Package(
                 "Models/MockProviderMode.swift",
                 "Models/MockDevice.swift",
                 "StatusBarController.swift",
+                "Server/FirehoseHeadless.swift",
                 "Server/MockServer.swift",
                 "Server/CaptureSession.swift",
                 "Server/ForwarderController.swift",

@@ -22,8 +22,15 @@ struct SocketClientInfo: Equatable {
     }
 }
 
+struct MockNotificationFirehoseConfig {
+    let hz: Double
+    let payloadBytes: Int
+    let maxFrames: Int
+}
+
 /// Socket server that implements the ImpossiBLE helper protocol with mock data.
-/// All socket I/O runs on `ioQueue`. UI-facing state is published on the main thread.
+/// Socket reads and protocol state run on `ioQueue`; socket writes run on
+/// `writeQueue` so sustained notifications cannot block protocol handling.
 final class MockServer: ObservableObject {
     enum Status: Equatable, Sendable {
         case stopped
@@ -39,6 +46,9 @@ final class MockServer: ObservableObject {
     @Published var pairedDeviceIDs: Set<String> = []
 
     private let ioQueue = DispatchQueue(label: "impossible.mock.io")
+    private let writeQueue = DispatchQueue(label: "impossible.mock.write")
+    private let traceNotifications = (ProcessInfo.processInfo.environment["IMPOSSIBLE_TRACE_NOTIFICATIONS"].map { $0 != "0" } ?? false)
+        || FileManager.default.fileExists(atPath: "/tmp/impossible-trace-notifications")
 
     // Guarded by ioQueue
     private var serverFd: Int32 = -1
@@ -55,6 +65,18 @@ final class MockServer: ObservableObject {
     private var writtenCharValues: [String: Data] = [:]
     private var writtenDescValues: [String: Data] = [:]
     private var notifyingCharacteristics = Set<String>()
+    private var firehoseConfig: MockNotificationFirehoseConfig?
+    private var firehoseTimers: [String: DispatchSourceTimer] = [:]
+    private var firehoseSequences: [String: UInt64] = [:]
+    private var generatedNotificationCount: UInt64 = 0
+    private var serializedNotificationCount: UInt64 = 0
+    private var serializedNotificationBytes: UInt64 = 0
+    private var lastNotificationTraceLog = CFAbsoluteTimeGetCurrent()
+
+    // Guarded by writeQueue
+    private var socketNotificationWriteCount: UInt64 = 0
+    private var socketNotificationWriteBytes: UInt64 = 0
+    private var lastSocketTraceLog = CFAbsoluteTimeGetCurrent()
 
     weak var store: MockStore?
 
@@ -63,6 +85,15 @@ final class MockServer: ObservableObject {
     init(autoStart: Bool = true) {
         if autoStart, UserDefaults.standard.bool(forKey: Self.serverEnabledKey) {
             start()
+        }
+    }
+
+    func configureNotificationFirehose(_ config: MockNotificationFirehoseConfig?) {
+        ioQueue.async { [self] in
+            firehoseConfig = config
+            if config == nil {
+                stopAllFirehoses()
+            }
         }
     }
 
@@ -159,6 +190,7 @@ final class MockServer: ObservableObject {
             writtenCharValues.removeAll()
             writtenDescValues.removeAll()
             notifyingCharacteristics.removeAll()
+            stopAllFirehoses()
             readBuffer.removeAll()
 
             publishDeviceState()
@@ -197,6 +229,7 @@ final class MockServer: ObservableObject {
         writtenCharValues.removeAll()
         writtenDescValues.removeAll()
         notifyingCharacteristics.removeAll()
+        stopAllFirehoses()
         scanActive = false
         scanTimer?.cancel()
         scanTimer = nil
@@ -232,6 +265,8 @@ final class MockServer: ObservableObject {
             scanActive = false
             connectedPeripherals.removeAll()
             pairedPeripherals.removeAll()
+            notifyingCharacteristics.removeAll()
+            stopAllFirehoses()
 
             publishDeviceState()
             publishStatus(.listening)
@@ -258,7 +293,18 @@ final class MockServer: ObservableObject {
         var payload = data
         payload.append(UInt8(ascii: "\n"))
         let fd = clientFd
-        write(payload, to: fd)
+        let generation = clientGeneration
+        let type = msg["type"] as? String ?? ""
+        if type == "didUpdateValue" {
+            serializedNotificationCount &+= 1
+            serializedNotificationBytes &+= UInt64(payload.count)
+            traceNotificationStage(
+                "serialization",
+                count: serializedNotificationCount,
+                bytes: serializedNotificationBytes
+            )
+        }
+        enqueueWrite(payload, to: fd, generation: generation, type: type)
     }
 
     private func sendConnectionRejected(to fd: Int32) {
@@ -277,19 +323,66 @@ final class MockServer: ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: msg) else { return }
         var payload = data
         payload.append(UInt8(ascii: "\n"))
-        write(payload, to: fd)
+        writeBlocking(payload, to: fd)
     }
 
-    private func write(_ payload: Data, to fd: Int32) {
+    private func enqueueWrite(_ payload: Data, to fd: Int32, generation: UInt64, type: String) {
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+
+            var isCurrentClient = false
+            self.ioQueue.sync {
+                isCurrentClient = self.clientFd == fd && self.clientGeneration == generation
+            }
+            guard isCurrentClient else { return }
+
+            guard self.writeBlocking(payload, to: fd) else {
+                self.ioQueue.async { [weak self] in
+                    guard let self,
+                          self.clientFd == fd,
+                          self.clientGeneration == generation
+                    else { return }
+                    self.log("Client write failed")
+                    self.readSource?.cancel()
+                    self.readSource = nil
+                    close(fd)
+                    self.clientFd = -1
+                    self.clientInfo = nil
+                    self.publishConnectedClient(nil)
+                    self.clientGeneration &+= 1
+                    self.stopAllFirehoses()
+                    self.publishStatus(.listening)
+                }
+                return
+            }
+
+            if type == "didUpdateValue" {
+                self.socketNotificationWriteCount &+= 1
+                self.socketNotificationWriteBytes &+= UInt64(payload.count)
+                self.traceSocketWriteStage()
+            }
+        }
+    }
+
+    @discardableResult
+    private func writeBlocking(_ payload: Data, to fd: Int32) -> Bool {
+        var ok = true
         payload.withUnsafeBytes { ptr in
             guard let base = ptr.baseAddress else { return }
             var written = 0
             while written < payload.count {
                 let n = Darwin.write(fd, base.advanced(by: written), payload.count - written)
-                if n <= 0 { break }
+                if n < 0, errno == EINTR {
+                    continue
+                }
+                if n <= 0 {
+                    ok = false
+                    break
+                }
                 written += n
             }
         }
+        return ok
     }
 
     private func peerClientInfo(for fd: Int32) -> SocketClientInfo? {
@@ -440,7 +533,11 @@ final class MockServer: ObservableObject {
         guard let uuidStr = msg["id"] as? String else { return }
         connectedPeripherals.remove(uuidStr)
         pairedPeripherals.remove(uuidStr)
-        notifyingCharacteristics = notifyingCharacteristics.filter { !$0.hasPrefix(uuidStr) }
+        let removed = notifyingCharacteristics.filter { $0.hasPrefix(uuidStr) }
+        notifyingCharacteristics.subtract(removed)
+        for charId in removed {
+            stopFirehose(for: charId)
+        }
         publishDeviceState()
         send([
             "type": "didDisconnect",
@@ -712,8 +809,10 @@ final class MockServer: ObservableObject {
 
         if enabled {
             notifyingCharacteristics.insert(charId)
+            startFirehoseIfConfigured(for: charId, peripheralUUID: peripheralUUID)
         } else {
             notifyingCharacteristics.remove(charId)
+            stopFirehose(for: charId)
         }
 
         send([
@@ -723,6 +822,97 @@ final class MockServer: ObservableObject {
             "enabled": enabled,
             "error": "",
         ])
+    }
+
+    private func startFirehoseIfConfigured(for charId: String, peripheralUUID: String) {
+        guard let config = firehoseConfig else { return }
+        stopFirehose(for: charId)
+
+        firehoseSequences[charId] = 0
+        let timer = DispatchSource.makeTimerSource(queue: ioQueue)
+        let interval = max(1, Int((1.0 / config.hz) * 1_000_000_000))
+        timer.schedule(
+            deadline: .now(),
+            repeating: .nanoseconds(interval),
+            leeway: .milliseconds(1)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.emitFirehoseNotification(
+                charId: charId,
+                peripheralUUID: peripheralUUID,
+                config: config
+            )
+        }
+        firehoseTimers[charId] = timer
+        timer.resume()
+        log("firehose start \(charId)")
+    }
+
+    private func emitFirehoseNotification(
+        charId: String,
+        peripheralUUID: String,
+        config: MockNotificationFirehoseConfig
+    ) {
+        guard clientFd >= 0, notifyingCharacteristics.contains(charId) else {
+            stopFirehose(for: charId)
+            return
+        }
+
+        let sequence = firehoseSequences[charId] ?? 0
+        if sequence >= UInt64(config.maxFrames) {
+            stopFirehose(for: charId)
+            log("firehose complete \(charId) frames=\(config.maxFrames)")
+            return
+        }
+
+        firehoseSequences[charId] = sequence &+ 1
+        generatedNotificationCount &+= 1
+        traceNotificationStage("corebluetooth_callback", count: generatedNotificationCount, bytes: 0)
+
+        send([
+            "type": "didUpdateValue",
+            "id": peripheralUUID,
+            "characteristicId": charId,
+            "value": firehosePayload(sequence: sequence, byteCount: config.payloadBytes).base64EncodedString(),
+            "error": "",
+        ])
+    }
+
+    private func stopFirehose(for charId: String) {
+        if let timer = firehoseTimers.removeValue(forKey: charId) {
+            timer.cancel()
+        }
+        firehoseSequences.removeValue(forKey: charId)
+    }
+
+    private func stopAllFirehoses() {
+        for timer in firehoseTimers.values {
+            timer.cancel()
+        }
+        firehoseTimers.removeAll()
+        firehoseSequences.removeAll()
+    }
+
+    private func firehosePayload(sequence: UInt64, byteCount: Int) -> Data {
+        let count = max(8, byteCount)
+        var data = Data(repeating: 0, count: count)
+        data.withUnsafeMutableBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+            var littleEndian = sequence.littleEndian
+            withUnsafeBytes(of: &littleEndian) { sequenceBytes in
+                for idx in 0..<min(8, sequenceBytes.count) {
+                    base[idx] = sequenceBytes[idx]
+                }
+            }
+            if count > 8 {
+                for idx in 8..<count {
+                    base[idx] = UInt8((Int(sequence) + idx) & 0xff)
+                }
+            }
+        }
+        return data
     }
 
     // MARK: - RSSI
@@ -810,6 +1000,31 @@ final class MockServer: ObservableObject {
             self?.connectedDeviceIDs = connected
             self?.pairedDeviceIDs = paired
         }
+    }
+
+    private func traceNotificationStage(_ stage: String, count: UInt64, bytes: UInt64) {
+        guard traceNotifications else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard count == 1 || now - lastNotificationTraceLog >= 1 else { return }
+        lastNotificationTraceLog = now
+        NSLog(
+            "ImpossiBLE-Mock: notification_trace stage=%@ count=%llu bytes=%llu",
+            stage,
+            count,
+            bytes
+        )
+    }
+
+    private func traceSocketWriteStage() {
+        guard traceNotifications else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard socketNotificationWriteCount == 1 || now - lastSocketTraceLog >= 1 else { return }
+        lastSocketTraceLog = now
+        NSLog(
+            "ImpossiBLE-Mock: notification_trace stage=socket_write count=%llu bytes=%llu",
+            socketNotificationWriteCount,
+            socketNotificationWriteBytes
+        )
     }
 
     private var pulseWorkItem: DispatchWorkItem?

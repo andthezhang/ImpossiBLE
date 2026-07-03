@@ -28,7 +28,7 @@ final class MockAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !AppPreferences.keepHelperRunningOnQuit,
-              let forwarder = MockApp.retainedRuntime?.forwarder,
+              let forwarder = MockAppUI.retainedRuntime?.forwarder,
               forwarder.isRunning
         else {
             return .terminateNow
@@ -41,8 +41,7 @@ final class MockAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
-struct MockApp: App {
+struct MockAppUI: App {
     fileprivate static var retainedRuntime: MockAppRuntime?
 
     @NSApplicationDelegateAdaptor(MockAppDelegate.self) private var appDelegate
@@ -69,6 +68,17 @@ struct MockApp: App {
     var body: some Scene {
         Settings {
             EmptyView()
+        }
+    }
+}
+
+@main
+enum MockAppMain {
+    static func main() {
+        if CommandLine.arguments.contains("--firehose-headless") {
+            FirehoseHeadless.run()
+        } else {
+            MockAppUI.main()
         }
     }
 }

@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <string.h>
 
 static void *kCBSDelegateQueueKey = &kCBSDelegateQueueKey;
 static void *kCBSIsScanningKey = &kCBSIsScanningKey;
@@ -34,6 +35,32 @@ static NSMutableDictionary<NSUUID *, NSSet<NSString *> *> *gAdvertisedServices;
 static NSMutableDictionary<NSString *, CBSChannel *> *gL2CAPChannels;
 static NSMutableDictionary<NSString *, dispatch_source_t> *gL2CAPReadSources;
 static NSMutableDictionary<NSString *, NSNumber *> *gL2CAPFds;
+static uint64_t gNotificationDelegateDeliveryCount = 0;
+static CFAbsoluteTime gLastNotificationDelegateDeliveryLog = 0;
+
+static BOOL cbs_trace_notifications_enabled(void) {
+    static BOOL enabled = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *env = getenv("IMPOSSIBLE_TRACE_NOTIFICATIONS");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ||
+                  access("/tmp/impossible-trace-notifications", F_OK) == 0;
+    });
+    return enabled;
+}
+
+static void cbs_trace_notification_delegate_delivery(void) {
+    if (!cbs_trace_notifications_enabled()) {
+        return;
+    }
+    gNotificationDelegateDeliveryCount += 1;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gNotificationDelegateDeliveryCount == 1 || now - gLastNotificationDelegateDeliveryLog >= 1.0) {
+        gLastNotificationDelegateDeliveryLog = now;
+        NSLog(@"ImpossiBLE: notification_trace stage=delegate_delivery count=%llu",
+              gNotificationDelegateDeliveryCount);
+    }
+}
 
 #pragma mark - State Change Notification
 
@@ -1236,6 +1263,7 @@ static void cbs_handle_message(NSDictionary *msg) {
         dispatch_queue_t queue = cbs_callback_queue_for_peripheral(peripheral);
         dispatch_async(queue, ^{
             [chr cbs_setValue:decodedValue];
+            cbs_trace_notification_delegate_delivery();
             [delegate peripheral:(CBPeripheral *)peripheral didUpdateValueForCharacteristic:(CBCharacteristic *)chr error:err];
         });
         return;

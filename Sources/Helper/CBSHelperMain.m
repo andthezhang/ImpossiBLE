@@ -53,6 +53,7 @@ static NSString *CBSStreamEventName(NSStreamEvent event) {
 @property(nonatomic, strong) CBCentralManager *central;
 @property(nonatomic, strong) dispatch_queue_t cbQueue;
 @property(nonatomic, strong) dispatch_queue_t ioQueue;
+@property(nonatomic, strong) dispatch_queue_t writeQueue;
 @property(nonatomic, strong) NSMutableDictionary<NSUUID *, CBPeripheral *> *peripherals;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, CBService *> *servicesById;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, CBCharacteristic *> *characteristicsById;
@@ -71,6 +72,49 @@ static NSString *CBSStreamEventName(NSStreamEvent event) {
 @property(nonatomic, assign) pid_t clientPid;
 @property(nonatomic, copy) NSString *clientProcessName;
 @end
+
+static BOOL CBSTraceNotificationsEnabled(void) {
+    static BOOL enabled = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *env = getenv("IMPOSSIBLE_TRACE_NOTIFICATIONS");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ||
+                  access("/tmp/impossible-trace-notifications", F_OK) == 0;
+    });
+    return enabled;
+}
+
+static void CBSTraceNotificationStage(NSString *stage, NSUInteger bytes) {
+    if (!CBSTraceNotificationsEnabled()) {
+        return;
+    }
+    static NSMutableDictionary<NSString *, NSNumber *> *counts;
+    static NSMutableDictionary<NSString *, NSNumber *> *byteCounts;
+    static NSMutableDictionary<NSString *, NSNumber *> *lastLogTimes;
+    static dispatch_queue_t traceQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        counts = [NSMutableDictionary dictionary];
+        byteCounts = [NSMutableDictionary dictionary];
+        lastLogTimes = [NSMutableDictionary dictionary];
+        traceQueue = dispatch_queue_create("impossible.helper.notification-trace", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(traceQueue, ^{
+        uint64_t count = counts[stage].unsignedLongLongValue + 1;
+        uint64_t totalBytes = byteCounts[stage].unsignedLongLongValue + (uint64_t)bytes;
+        counts[stage] = @(count);
+        byteCounts[stage] = @(totalBytes);
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        CFAbsoluteTime last = lastLogTimes[stage].doubleValue;
+        if (count == 1 || now - last >= 1.0) {
+            lastLogTimes[stage] = @(now);
+            NSLog(@"ImpossiBLE-Helper: notification_trace stage=%@ count=%llu bytes=%llu",
+                  stage,
+                  count,
+                  totalBytes);
+        }
+    });
+}
 
 @implementation CBSHelper
 
@@ -100,6 +144,7 @@ static NSString *CBSProcessNameForPID(pid_t pid) {
     if (self) {
         _cbQueue = dispatch_queue_create("impossible.cb", DISPATCH_QUEUE_SERIAL);
         _ioQueue = dispatch_queue_create("impossible.io", DISPATCH_QUEUE_SERIAL);
+        _writeQueue = dispatch_queue_create("impossible.write", DISPATCH_QUEUE_SERIAL);
         _central = [[CBCentralManager alloc] initWithDelegate:self queue:_cbQueue options:nil];
         _peripherals = [NSMutableDictionary dictionary];
         _servicesById = [NSMutableDictionary dictionary];
@@ -917,17 +962,38 @@ static NSString *CBSProcessNameForPID(pid_t pid) {
         if (!data) {
             return;
         }
-        if (![self writeAllToFd:fd bytes:data.bytes length:data.length]) {
-            CBSDebugLog(@"write to client failed (type=%@ len=%lu) errno=%d; disconnecting",
-                        msg[@"type"], (unsigned long)data.length, errno);
-            [self handleClientDisconnectLockedForFd:fd generation:generation];
+        NSString *type = [msg[@"type"] isKindOfClass:[NSString class]] ? msg[@"type"] : @"";
+        NSMutableData *payload = [data mutableCopy];
+        const char newline = '\n';
+        [payload appendBytes:&newline length:1];
+        if ([type isEqualToString:@"didUpdateValue"]) {
+            CBSTraceNotificationStage(@"serialization", payload.length);
+        }
+        [self enqueuePayload:payload fd:fd generation:generation type:type];
+    });
+}
+
+- (void)enqueuePayload:(NSData *)payload fd:(int)fd generation:(uint64_t)generation type:(NSString *)type {
+    dispatch_async(self.writeQueue, ^{
+        __block BOOL isCurrentClient = NO;
+        dispatch_sync(self.ioQueue, ^{
+            isCurrentClient = (self.clientFd == fd && self.clientGeneration == generation);
+        });
+        if (!isCurrentClient) {
             return;
         }
-        if (![self writeAllToFd:fd bytes:"\n" length:1]) {
-            CBSDebugLog(@"write newline to client failed (type=%@) errno=%d; disconnecting",
-                        msg[@"type"], errno);
-            [self handleClientDisconnectLockedForFd:fd generation:generation];
+        if (![self writeAllToFd:fd bytes:payload.bytes length:payload.length]) {
+            CBSDebugLog(@"write to client failed (type=%@ len=%lu) errno=%d; disconnecting",
+                        type, (unsigned long)payload.length, errno);
+            dispatch_async(self.ioQueue, ^{
+                if (self.clientFd == fd && self.clientGeneration == generation) {
+                    [self handleClientDisconnectLockedForFd:fd generation:generation];
+                }
+            });
             return;
+        }
+        if ([type isEqualToString:@"didUpdateValue"]) {
+            CBSTraceNotificationStage(@"socket_write", payload.length);
         }
     });
 }
@@ -972,6 +1038,9 @@ static NSString *CBSProcessNameForPID(pid_t pid) {
     size_t remaining = length;
     while (remaining > 0) {
         ssize_t n = write(fd, ptr, remaining);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
             return NO;
         }
@@ -1416,6 +1485,7 @@ connectionEventDidOccur:(CBConnectionEvent)event
     if (![chId isKindOfClass:[NSString class]]) {
         return;
     }
+    CBSTraceNotificationStage(@"corebluetooth_callback", characteristic.value.length);
     NSString *b64 = characteristic.value ? [characteristic.value base64EncodedStringWithOptions:0] : @"";
     NSString *errStr = error ? [error localizedDescription] : @"";
     [self sendMessage:@{
