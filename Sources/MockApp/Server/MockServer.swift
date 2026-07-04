@@ -72,7 +72,7 @@ final class MockServer: ObservableObject {
     private var firehoseTimers: [String: DispatchSourceTimer] = [:]
     private var firehoseSequences: [String: UInt64] = [:]
     private var nirvaStreamTimers: [String: DispatchSourceTimer] = [:]
-    private var nirvaStreamCounters: [String: (counter: UInt8, leftChannel: Bool)] = [:]
+    private var nirvaStreamCounters: [String: (tick: Int, counter: UInt8, leftChannel: Bool)] = [:]
     private var generatedNotificationCount: UInt64 = 0
     private var serializedNotificationCount: UInt64 = 0
     private var serializedNotificationBytes: UInt64 = 0
@@ -764,6 +764,15 @@ final class MockServer: ObservableObject {
                 stopNirvaStream(peripheralUUID: peripheralUUID)
             }
         }
+        if !result.dssFrames.isEmpty {
+            log("nirva offline send \(result.dssFrames.count) DSS frames")
+            // ponytail: burst all frames — the socket write queue serializes
+            // them in order and files are a few KB; pace only if a huge
+            // synthetic file ever floods the client.
+            for frame in result.dssFrames {
+                nirvaNotify(peripheralUUID: peripheralUUID, charUUID: NirvaMockProvider.dssDataCharUUID, value: frame)
+            }
+        }
     }
 
     /// Notify a characteristic (by UUID) on a device, if the client subscribed.
@@ -788,7 +797,7 @@ final class MockServer: ObservableObject {
 
     private func startNirvaStream(peripheralUUID: String) {
         stopNirvaStream(peripheralUUID: peripheralUUID)
-        nirvaStreamCounters[peripheralUUID] = (counter: 0, leftChannel: true)
+        nirvaStreamCounters[peripheralUUID] = (tick: 0, counter: 0, leftChannel: true)
 
         let timer = DispatchSource.makeTimerSource(queue: ioQueue)
         let interval = DispatchTimeInterval.milliseconds(NirvaMockProvider.streamIntervalMs)
@@ -802,7 +811,14 @@ final class MockServer: ObservableObject {
                 self.stopNirvaStream(peripheralUUID: peripheralUUID)
                 return
             }
-            let packet = NirvaMockProvider.audioPacket(counter: state.counter, leftChannel: state.leftChannel)
+            let lc3 = NirvaMockAudio.streamPayload(tick: state.tick)
+            state.tick += 1
+            guard let lc3 else {  // wall-clock gap phase: no notification
+                self.nirvaStreamCounters[peripheralUUID] = state
+                return
+            }
+            let packet = NirvaMockProvider.audioPacket(
+                counter: state.counter, leftChannel: state.leftChannel, lc3: lc3)
             state.counter &+= 1
             state.leftChannel.toggle()
             self.nirvaStreamCounters[peripheralUUID] = state

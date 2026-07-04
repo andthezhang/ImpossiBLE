@@ -114,6 +114,54 @@ for i, f in enumerate(frames):
     assert counter == frames[0][4] + i, "counter gap"
     assert f[5] in (0x01, 0x02) and f[5] != frames[i - 1][5] if i else True, "tag"
 
+# LIST 0x000E -> 0x010E pages ("name,size\n") + empty terminator
+write_cmd(pkt(0x000E, 20))
+page = rsp_value()
+assert page[:2] == b"\x0e\x01" and page[4] == 20, page.hex()
+lines = page[5:].decode().strip().split("\n")
+files = [tuple(l.split(",")) for l in lines]
+assert all(n.startswith("lc3_") and n.endswith(".bin") for n, _ in files), files
+term = rsp_value()
+assert term == pkt(0x010E, 20), term.hex()
+
+# SEND 0x000F -> 0x010F [size u32][chunks u32], then raw DSS frames on DSS char
+name, size = files[0]
+write_cmd(pkt(0x000F, 21, name.encode()))
+plan = rsp_value()
+assert plan[:2] == b"\x0f\x01", plan.hex()
+total_size, chunk_count = struct.unpack_from("<II", plan, 5)
+assert total_size == int(size) and chunk_count > 2, (total_size, size, chunk_count)
+
+
+def crc16(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc
+
+
+dss = []
+wire_bytes = 0
+while len(dss) < chunk_count:
+    msg = c.wait_for("didUpdateValue", characteristicId=chars[DSS_DATA])
+    f = base64.b64decode(msg["value"])
+    seq, ts, dtype = struct.unpack_from("<HIB", f)
+    assert seq == len(dss), (seq, len(dss))                    # contiguous from 0
+    assert struct.unpack("<H", f[-2:])[0] == crc16(f[:-2])     # CRC16 valid
+    assert dtype == (0x01 if seq == 0 else 0x03 if seq == chunk_count - 1 else 0x02)
+    if dtype == 0x02:  # LC3_DATA: [01][lenL][L][02][lenR][R]
+        d = f[7:-2]
+        assert d[0] == 0x01 and d[2 + d[1]] == 0x02, d.hex()
+    dss.append(f)
+    wire_bytes += len(f)
+assert wire_bytes == total_size, (wire_bytes, total_size)
+
+# Unknown file -> plan [0][0]
+write_cmd(pkt(0x000F, 22, b"lc3_9999.bin"))
+assert rsp_value() == pkt(0x010F, 22, struct.pack("<II", 0, 0))
+
 # STREAMING 0x0010 [00] -> ack, stream stops
 write_cmd(pkt(0x0010, 9, b"\x00"))
 deadline = time.time() + 1
@@ -127,4 +175,5 @@ while time.time() < deadline:
         break
 assert tail <= 5, f"stream did not stop ({tail} extra frames)"
 
-print(f"OK: auth echo + {len(frames)} DSS frames, counters contiguous, stream stops on disable")
+print(f"OK: auth echo + {len(frames)} audio pkts + LIST {len(files)} files + "
+      f"drain {name} ({chunk_count} DSS frames, {wire_bytes}B, CRC/seq valid), stream stops on disable")

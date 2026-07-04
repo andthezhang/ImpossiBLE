@@ -15,6 +15,17 @@ import Foundation
 ///                        characteristic: `[02 01][len][ctr][tag][LC3 bytes]`,
 ///                        one global rolling counter reset to 0 on start,
 ///                        tag 0x01 = left mic, 0x02 = right mic.
+/// - 0x000E LIST        → one or more 0x010E responses with "name,size\n"
+///                        lines, then an empty 0x010E terminator.
+/// - 0x000F SEND        → 0x010F `[totalSize u32 LE][chunkCount u32 LE]`
+///                        (unknown file → [0][0]), then the file's raw DSS
+///                        frames as notifications on the DSS characteristic.
+///
+/// DSS frame (dss_frame.c): `[SeqID u16 LE][Ts u32 LE][DataType u8][Data][CRC16 LE]`
+/// CRC16 = reflected CCITT, poly 0x8408, seed 0xFFFF, over header+data
+/// (validated against tests/host/samples/dss_frame_sample_v1.json).
+/// Types: 0x01 FILE_BEGIN, 0x02 LC3_DATA (`[0x01][lenL][L][0x02][lenR][R]`),
+/// 0x03 FILE_END. Seq starts at 0 per file; totalSize = sum of wire bytes.
 ///
 /// ponytail: canned zero-filled "LC3" payloads — enough for connect/notify
 /// assertions; swap in real LC3 frames when a test decodes audio.
@@ -27,9 +38,6 @@ enum NirvaMockProvider {
     static let dssDataCharUUID = "A7D41001-5E2B-4C91-9F3A-8B27D6E14A90"
     static let dssCodecCharUUID = "A7D41002-5E2B-4C91-9F3A-8B27D6E14A90"
 
-    /// Two concatenated 10 ms LC3 frames per audio packet (firmware sends
-    /// whole frames per notification; 40 B per frame at 16 kHz/32 kbps).
-    static let lc3PayloadBytes = 80
     /// One packet per 10 ms, alternating left/right tags — matches the
     /// firmware's per-channel 20 ms cadence.
     static let streamIntervalMs = 10
@@ -37,6 +45,77 @@ enum NirvaMockProvider {
     struct WriteResult {
         var responses: [Data] = []
         var setStreaming: Bool?
+        /// Raw DSS frames to notify on the DSS data characteristic (offline
+        /// file drain after a 0x000F SEND).
+        var dssFrames: [Data] = []
+    }
+
+    // MARK: - Synthetic offline files
+
+    struct SyntheticFile {
+        let name: String
+        let frames: [Data]
+        var totalSize: UInt32 { UInt32(frames.reduce(0) { $0 + $1.count }) }
+        var chunkCount: UInt32 { UInt32(frames.count) }
+    }
+
+    /// Two small offline recordings, epochs a few minutes in the past so the
+    /// app's oldest-first cursor and capturedAt mapping are exercised.
+    /// Regenerated per process launch.
+    static let syntheticFiles: [SyntheticFile] = {
+        let now = UInt32(Date().timeIntervalSince1970)
+        return [
+            makeSyntheticFile(epoch: now - 600, lc3FrameCount: 25),
+            makeSyntheticFile(epoch: now - 300, lc3FrameCount: 25),
+        ]
+    }()
+
+    static func makeSyntheticFile(epoch: UInt32, lc3FrameCount: Int) -> SyntheticFile {
+        var frames: [Data] = []
+        var seq: UInt16 = 0
+        frames.append(dssFrame(seq: seq, ts: epoch, type: 0x01, data: []))  // FILE_BEGIN
+        for i in 0..<lc3FrameCount {
+            // Real liblc3-encoded silence frames so the app's WAV decode is
+            // clean; tone frames would also work but silence matches the
+            // "quiet recording" fixture intent.
+            let left = NirvaMockAudio.silenceFrames[(i * 2) % NirvaMockAudio.silenceFrames.count]
+            let right = NirvaMockAudio.silenceFrames[(i * 2 + 1) % NirvaMockAudio.silenceFrames.count]
+            var lc3Data: [UInt8] = [0x01, UInt8(left.count)]
+            lc3Data.append(contentsOf: left)
+            lc3Data.append(contentsOf: [0x02, UInt8(right.count)])
+            lc3Data.append(contentsOf: right)
+            seq &+= 1
+            frames.append(dssFrame(seq: seq, ts: epoch, type: 0x02, data: lc3Data))
+        }
+        seq &+= 1
+        frames.append(dssFrame(seq: seq, ts: epoch, type: 0x03, data: []))  // FILE_END
+        return SyntheticFile(name: "lc3_\(epoch).bin", frames: frames)
+    }
+
+    static func dssFrame(seq: UInt16, ts: UInt32, type: UInt8, data: [UInt8]) -> Data {
+        var frame: [UInt8] = [
+            UInt8(seq & 0xFF), UInt8(seq >> 8),
+            UInt8(ts & 0xFF), UInt8((ts >> 8) & 0xFF), UInt8((ts >> 16) & 0xFF), UInt8(ts >> 24),
+            type,
+        ]
+        frame.append(contentsOf: data)
+        let crc = crc16CCITT(frame)
+        frame.append(UInt8(crc & 0xFF))
+        frame.append(UInt8(crc >> 8))
+        return Data(frame)
+    }
+
+    /// Reflected CRC16-CCITT (poly 0x8408, seed 0xFFFF) — matches Zephyr's
+    /// crc16_ccitt used by dss_frame.c.
+    static func crc16CCITT(_ bytes: [UInt8]) -> UInt16 {
+        var crc: UInt16 = 0xFFFF
+        for byte in bytes {
+            crc ^= UInt16(byte)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0x8408 : crc >> 1
+            }
+        }
+        return crc
     }
 
     /// Process a write to the CMS command characteristic.
@@ -57,16 +136,43 @@ enum NirvaMockProvider {
             guard let enable = payload.first, enable == 0x00 || enable == 0x01 else { break }
             result.setStreaming = enable == 0x01
             result.responses.append(build(cmd: cmd, counter: counter, payload: [0x01]))
+        case 0x000E: // GET_AUDIO_FILE_LIST → 0x010E pages + empty terminator
+            let listing = syntheticFiles.map { "\($0.name),\($0.totalSize)\n" }.joined()
+            result.responses.append(build(cmd: 0x010E, counter: counter, payload: Array(listing.utf8)))
+            result.responses.append(build(cmd: 0x010E, counter: counter, payload: []))
+        case 0x000F: // GET_AUDIO_FILE_DATA → 0x010F plan, then DSS frames
+            let name = filename(from: payload)
+            guard let file = syntheticFiles.first(where: { $0.name == name }) else {
+                result.responses.append(build(cmd: 0x010F, counter: counter, payload: u32le(0) + u32le(0)))
+                break
+            }
+            result.responses.append(
+                build(cmd: 0x010F, counter: counter, payload: u32le(file.totalSize) + u32le(file.chunkCount))
+            )
+            result.dssFrames = file.frames
         default: // SYNC_TIME and the rest: firmware logs and stays silent
             break
         }
         return result
     }
 
-    /// Canned 0x0102 audio streaming packet for the DSS data characteristic.
-    static func audioPacket(counter: UInt8, leftChannel: Bool) -> Data {
+    /// Firmware copies the name up to ',', CR, LF, or NUL (cmd_handler.c
+    /// copy_lc3_name_from_payload).
+    private static func filename(from payload: [UInt8]) -> String {
+        let terminators: Set<UInt8> = [0x2C, 0x0D, 0x0A, 0x00]
+        let nameBytes = payload.prefix { !terminators.contains($0) }
+        return String(decoding: nameBytes, as: UTF8.self)
+    }
+
+    private static func u32le(_ v: UInt32) -> [UInt8] {
+        [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)]
+    }
+
+    /// 0x0102 audio streaming packet for the DSS data characteristic.
+    /// `lc3` is two concatenated 10 ms frames from `NirvaMockAudio`.
+    static func audioPacket(counter: UInt8, leftChannel: Bool, lc3: Data) -> Data {
         var payload: [UInt8] = [leftChannel ? 0x01 : 0x02]
-        payload.append(contentsOf: [UInt8](repeating: 0, count: lc3PayloadBytes))
+        payload.append(contentsOf: lc3)
         return build(cmd: 0x0102, counter: counter, payload: payload)
     }
 

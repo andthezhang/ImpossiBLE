@@ -25,6 +25,7 @@ let package = Package(
                 "StatusBarController.swift",
                 "Server/FirehoseHeadless.swift",
                 "Server/NirvaMockProvider.swift",
+                "Server/NirvaMockAudio.swift",
                 "Server/MockServer.swift",
                 "Server/CaptureSession.swift",
                 "Server/ForwarderController.swift",
