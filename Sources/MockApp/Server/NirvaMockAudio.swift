@@ -2,38 +2,24 @@ import Foundation
 
 /// Canned LC3 frames for the Nirva mock's streaming pattern (16 kHz, 10 ms,
 /// 40 B @ 32 kbps), generated from the app's vendored liblc3 by
-/// Tools/gen-nirva-lc3-frames.c. The stream plays a speech→quiet→gap→quiet
-/// pattern so the app's VoiceActivityDetector goes speech-active and then —
-/// on resume after the wall-clock gap — reports a silence duration above the
-/// drain controller's 10 s threshold (`drain_eligible state=vad_quiet`).
-/// The VAD only reports silence after speech has started, so an all-silent
-/// stream would never open a drain window.
+/// Tools/gen-nirva-lc3-frames.c. The stream plays continuous digital silence
+/// from the first packet. This exercises the app's fix for
+/// Nirva-AI/nirva_service#739: the Lc3StreamProcessor now accumulates silent
+/// audio time and reports it periodically, so a pure-silence stream crosses
+/// the drain controller's 10 s threshold (`drain_eligible state=vad_quiet`)
+/// on its own — no speech→quiet→gap workaround required.
 enum NirvaMockAudio {
-    /// 300 frames of a continuous 1 kHz tone, amplitude 12000.
+    /// 300 frames of a continuous 1 kHz tone, amplitude 12000. Retained for
+    /// tests that need a speech-active stream; the drain fixture no longer
+    /// uses it.
     static let toneFrames = frames(base64: toneB64)
     /// 100 frames of encoded digital silence.
     static let silenceFrames = frames(base64: silenceB64)
 
-    // Stream schedule in 10 ms ticks: 1.5 s tone, 1 s quiet tail (arms the
-    // VAD's silenceStartTime), 12 s of NO packets (the wall-clock gap the
-    // VAD converts into a >10 s silence report), then quiet forever.
-    static let toneTicks = 150
-    static let quietTailTicks = 100
-    static let gapTicks = 1200
-
-    /// Two concatenated 10 ms LC3 frames for this tick, or nil during the
-    /// gap (no notification at all).
+    /// Two concatenated 10 ms LC3 silence frames for this tick. Always
+    /// present (no packet gap) so the app receives a steady real-time
+    /// silent stream.
     static func streamPayload(tick: Int) -> Data? {
-        if tick < toneTicks {
-            return toneFrames[(tick * 2) % toneFrames.count]
-                + toneFrames[(tick * 2 + 1) % toneFrames.count]
-        }
-        if tick < toneTicks + quietTailTicks {
-            return silencePayload(tick: tick)
-        }
-        if tick < toneTicks + quietTailTicks + gapTicks {
-            return nil
-        }
         return silencePayload(tick: tick)
     }
 
