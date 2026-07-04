@@ -77,6 +77,8 @@ enum MockAppMain {
     static func main() {
         if CommandLine.arguments.contains("--firehose-headless") {
             FirehoseHeadless.run()
+        } else if CommandLine.arguments.contains("--nirva-headless") {
+            NirvaHeadless.run()
         } else {
             MockAppUI.main()
         }

@@ -1,6 +1,9 @@
 import Foundation
 
-private let kSocketPath = "/tmp/impossible.sock"
+// Overridable so tests can run against an isolated socket while a real
+// provider owns /tmp/impossible.sock. The simulator client library always
+// uses the default path.
+private let kSocketPath = ProcessInfo.processInfo.environment["IMPOSSIBLE_MOCK_SOCKET"] ?? "/tmp/impossible.sock"
 
 struct SocketClientInfo: Equatable {
     let pid: pid_t
@@ -68,6 +71,8 @@ final class MockServer: ObservableObject {
     private var firehoseConfig: MockNotificationFirehoseConfig?
     private var firehoseTimers: [String: DispatchSourceTimer] = [:]
     private var firehoseSequences: [String: UInt64] = [:]
+    private var nirvaStreamTimers: [String: DispatchSourceTimer] = [:]
+    private var nirvaStreamCounters: [String: (counter: UInt8, leftChannel: Bool)] = [:]
     private var generatedNotificationCount: UInt64 = 0
     private var serializedNotificationCount: UInt64 = 0
     private var serializedNotificationBytes: UInt64 = 0
@@ -191,6 +196,7 @@ final class MockServer: ObservableObject {
             writtenDescValues.removeAll()
             notifyingCharacteristics.removeAll()
             stopAllFirehoses()
+            stopAllNirvaStreams()
             readBuffer.removeAll()
 
             publishDeviceState()
@@ -230,6 +236,7 @@ final class MockServer: ObservableObject {
         writtenDescValues.removeAll()
         notifyingCharacteristics.removeAll()
         stopAllFirehoses()
+        stopAllNirvaStreams()
         scanActive = false
         scanTimer?.cancel()
         scanTimer = nil
@@ -267,6 +274,7 @@ final class MockServer: ObservableObject {
             pairedPeripherals.removeAll()
             notifyingCharacteristics.removeAll()
             stopAllFirehoses()
+            stopAllNirvaStreams()
 
             publishDeviceState()
             publishStatus(.listening)
@@ -351,6 +359,7 @@ final class MockServer: ObservableObject {
                     self.publishConnectedClient(nil)
                     self.clientGeneration &+= 1
                     self.stopAllFirehoses()
+                    self.stopAllNirvaStreams()
                     self.publishStatus(.listening)
                 }
                 return
@@ -538,6 +547,7 @@ final class MockServer: ObservableObject {
         for charId in removed {
             stopFirehose(for: charId)
         }
+        stopNirvaStream(peripheralUUID: uuidStr)
         publishDeviceState()
         send([
             "type": "didDisconnect",
@@ -734,6 +744,88 @@ final class MockServer: ObservableObject {
                 "error": "",
             ])
         }
+
+        if String(parts[3]).uppercased() == NirvaMockProvider.cmsCmdCharUUID {
+            handleNirvaCommand(peripheralUUID: peripheralUUID, packet: writtenCharValues[charId] ?? Data())
+        }
+    }
+
+    // MARK: - Nirva provider (stateful request → notify)
+
+    private func handleNirvaCommand(peripheralUUID: String, packet: Data) {
+        let result = NirvaMockProvider.handleCommand(packet)
+        for response in result.responses {
+            nirvaNotify(peripheralUUID: peripheralUUID, charUUID: NirvaMockProvider.cmsRspCharUUID, value: response)
+        }
+        if let streaming = result.setStreaming {
+            if streaming {
+                startNirvaStream(peripheralUUID: peripheralUUID)
+            } else {
+                stopNirvaStream(peripheralUUID: peripheralUUID)
+            }
+        }
+    }
+
+    /// Notify a characteristic (by UUID) on a device, if the client subscribed.
+    private func nirvaNotify(peripheralUUID: String, charUUID: String, value: Data) {
+        guard let device = fetchDevice(uuid: peripheralUUID) else { return }
+        for (svcIdx, svc) in device.services.enumerated() {
+            for (charIdx, ch) in svc.characteristics.enumerated()
+            where ch.uuid.uppercased() == charUUID {
+                let charId = "\(peripheralUUID):\(svc.uuid):\(svcIdx):\(ch.uuid):\(charIdx)"
+                guard notifyingCharacteristics.contains(charId) else { return }
+                send([
+                    "type": "didUpdateValue",
+                    "id": peripheralUUID,
+                    "characteristicId": charId,
+                    "value": value.base64EncodedString(),
+                    "error": "",
+                ])
+                return
+            }
+        }
+    }
+
+    private func startNirvaStream(peripheralUUID: String) {
+        stopNirvaStream(peripheralUUID: peripheralUUID)
+        nirvaStreamCounters[peripheralUUID] = (counter: 0, leftChannel: true)
+
+        let timer = DispatchSource.makeTimerSource(queue: ioQueue)
+        let interval = DispatchTimeInterval.milliseconds(NirvaMockProvider.streamIntervalMs)
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.clientFd >= 0,
+                  self.connectedPeripherals.contains(peripheralUUID),
+                  var state = self.nirvaStreamCounters[peripheralUUID]
+            else {
+                self.stopNirvaStream(peripheralUUID: peripheralUUID)
+                return
+            }
+            let packet = NirvaMockProvider.audioPacket(counter: state.counter, leftChannel: state.leftChannel)
+            state.counter &+= 1
+            state.leftChannel.toggle()
+            self.nirvaStreamCounters[peripheralUUID] = state
+            self.nirvaNotify(peripheralUUID: peripheralUUID, charUUID: NirvaMockProvider.dssDataCharUUID, value: packet)
+        }
+        nirvaStreamTimers[peripheralUUID] = timer
+        timer.resume()
+        log("nirva stream start \(peripheralUUID)")
+    }
+
+    private func stopNirvaStream(peripheralUUID: String) {
+        if let timer = nirvaStreamTimers.removeValue(forKey: peripheralUUID) {
+            timer.cancel()
+        }
+        nirvaStreamCounters.removeValue(forKey: peripheralUUID)
+    }
+
+    private func stopAllNirvaStreams() {
+        for timer in nirvaStreamTimers.values {
+            timer.cancel()
+        }
+        nirvaStreamTimers.removeAll()
+        nirvaStreamCounters.removeAll()
     }
 
     private func handleReadDescriptor(_ msg: [String: Any]) {

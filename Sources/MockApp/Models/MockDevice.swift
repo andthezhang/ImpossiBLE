@@ -155,6 +155,7 @@ enum StockConfigurations {
         deviceInfoPeripheral,
         multiServiceSensor,
         denseSensorEnvironment,
+        NirvaMockProvider.stockConfiguration,
     ]
 
     static let heartRateMonitor = MockConfiguration(
