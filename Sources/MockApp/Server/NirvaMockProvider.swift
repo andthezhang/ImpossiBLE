@@ -20,6 +20,11 @@ import Foundation
 /// - 0x000F SEND        → 0x010F `[totalSize u32 LE][chunkCount u32 LE]`
 ///                        (unknown file → [0][0]), then the file's raw DSS
 ///                        frames as notifications on the DSS characteristic.
+/// - 0x0201 QUERY       → full 110-byte unified payload.
+/// - 0x0202 SET/ACTION  → firmware-style mask dispatch. QUERY_LFS_FILES
+///                        replies on legacy action cmd 0x0093; SEND_LC3_DUMP
+///                        acks on 0x0202, emits a 0x010F send plan, then DSS
+///                        frames for the oldest advertised synthetic file.
 ///
 /// DSS frame (dss_frame.c): `[SeqID u16 LE][Ts u32 LE][DataType u8][Data][CRC16 LE]`
 /// CRC16 = reflected CCITT, poly 0x8408, seed 0xFFFF, over header+data
@@ -27,8 +32,8 @@ import Foundation
 /// Types: 0x01 FILE_BEGIN, 0x02 LC3_DATA (`[0x01][lenL][L][0x02][lenR][R]`),
 /// 0x03 FILE_END. Seq starts at 0 per file; totalSize = sum of wire bytes.
 ///
-/// ponytail: canned zero-filled "LC3" payloads — enough for connect/notify
-/// assertions; swap in real LC3 frames when a test decodes audio.
+/// Live streaming uses 40-byte silence frames; sealed offline files use
+/// 20-byte 16 kbps frames so Nirva's offline WAV decoder can drain them.
 enum NirvaMockProvider {
 
     static let cmsServiceUUID = "A7D42000-5E2B-4C91-9F3A-8B27D6E14A90"
@@ -41,6 +46,8 @@ enum NirvaMockProvider {
     /// One packet per 10 ms, alternating left/right tags — matches the
     /// firmware's per-channel 20 ms cadence.
     static let streamIntervalMs = 10
+    private static let unifiedPayloadSize = 110
+    private static let moduleStatusOffset = 88
 
     struct WriteResult {
         var responses: [Data] = []
@@ -78,8 +85,8 @@ enum NirvaMockProvider {
             // Real liblc3-encoded silence frames so the app's WAV decode is
             // clean; tone frames would also work but silence matches the
             // "quiet recording" fixture intent.
-            let left = NirvaMockAudio.silenceFrames[(i * 2) % NirvaMockAudio.silenceFrames.count]
-            let right = NirvaMockAudio.silenceFrames[(i * 2 + 1) % NirvaMockAudio.silenceFrames.count]
+            let left = NirvaMockAudio.offlineSilenceFrames[(i * 2) % NirvaMockAudio.offlineSilenceFrames.count]
+            let right = NirvaMockAudio.offlineSilenceFrames[(i * 2 + 1) % NirvaMockAudio.offlineSilenceFrames.count]
             var lc3Data: [UInt8] = [0x01, UInt8(left.count)]
             lc3Data.append(contentsOf: left)
             lc3Data.append(contentsOf: [0x02, UInt8(right.count)])
@@ -150,10 +157,77 @@ enum NirvaMockProvider {
                 build(cmd: 0x010F, counter: counter, payload: u32le(file.totalSize) + u32le(file.chunkCount))
             )
             result.dssFrames = file.frames
+        case 0x0201: // NIRVA_QUERY_PARAMS → packed nirva_payload_t
+            result.responses.append(build(cmd: cmd, counter: counter, payload: unifiedPayload()))
+        case 0x0202: // NIRVA_SET_PARAMS → mask-triggered actions
+            handleUnifiedAction(payload: payload, counter: counter, result: &result)
         default: // SYNC_TIME and the rest: firmware logs and stays silent
             break
         }
         return result
+    }
+
+    private static func handleUnifiedAction(payload: [UInt8], counter: UInt8, result: inout WriteResult) {
+        var shouldAck = false
+        if hasMask(payload, 2) { // SYS_DATE
+            shouldAck = true
+        }
+        if hasMask(payload, 9) { // QUERY_LFS_FILES
+            let listing = syntheticFiles.map { "\($0.name),\($0.totalSize)\n" }.joined()
+            result.responses.append(build(cmd: 0x0093, counter: counter, payload: Array(listing.utf8)))
+            shouldAck = true
+        }
+        if hasMask(payload, 11) { // START_LC3
+            result.setStreaming = true
+            shouldAck = true
+        }
+        if hasMask(payload, 12) { // STOP_LC3
+            result.setStreaming = false
+            shouldAck = true
+        }
+        if hasMask(payload, 13) { // SEND_LC3_DUMP
+            result.responses.append(build(cmd: 0x0202, counter: counter, payload: [0x01]))
+            appendSendPlanAndFrames(for: syntheticFiles.first, counter: counter, result: &result)
+        }
+        if hasMask(payload, 23) { // QUERY_FW_VER
+            result.responses.append(build(cmd: 0x0202, counter: counter, payload: Array("1.1.1+8-impossible-mock".utf8)))
+            shouldAck = true
+        }
+        if shouldAck {
+            result.responses.append(build(cmd: 0x0202, counter: counter, payload: []))
+        }
+    }
+
+    private static func appendSendPlanAndFrames(
+        for file: SyntheticFile?,
+        counter: UInt8,
+        result: inout WriteResult
+    ) {
+        guard let file else {
+            result.responses.append(build(cmd: 0x010F, counter: counter, payload: u32le(0) + u32le(0)))
+            return
+        }
+        result.responses.append(
+            build(cmd: 0x010F, counter: counter, payload: u32le(file.totalSize) + u32le(file.chunkCount))
+        )
+        result.dssFrames = file.frames
+    }
+
+    private static func hasMask(_ payload: [UInt8], _ bit: Int) -> Bool {
+        let byteIndex = bit / 8
+        guard payload.indices.contains(byteIndex) else { return false }
+        return (payload[byteIndex] & UInt8(1 << (bit % 8))) != 0
+    }
+
+    private static func unifiedPayload() -> [UInt8] {
+        var payload = [UInt8](repeating: 0, count: unifiedPayloadSize)
+        for bit in 1...24 {
+            payload[bit / 8] |= UInt8(1 << (bit % 8))
+        }
+        payload[moduleStatusOffset] = 1      // mic_is_open
+        payload[moduleStatusOffset + 1] = 0  // lc3_is_streaming
+        payload[moduleStatusOffset + 2] = 0  // record_is_writing
+        return payload
     }
 
     /// Firmware copies the name up to ',', CR, LF, or NUL (cmd_handler.c

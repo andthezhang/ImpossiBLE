@@ -8,7 +8,8 @@ Speaks the ImpossiBLE socket protocol directly against a headless mock:
   python3 Tests/nirva-mock-check.py /tmp/impossible-nirva-test.sock
 
 Verifies scan -> connect -> discover -> subscribe -> AUTH echo ->
-streaming start (0x0102 DSS packets, rolling counter, L/R tags) -> stop.
+unified status/version -> streaming start (0x0102 DSS packets, rolling
+counter, L/R tags) -> 0x0202 offline LIST/SEND drain -> stop.
 """
 import base64
 import json
@@ -26,6 +27,13 @@ DEADLINE = time.time() + 10  # sim-connect assertions must fit in 10s
 
 def pkt(cmd, counter, payload=b""):
     return struct.pack("<HHB", cmd, len(payload), counter) + payload
+
+
+def unified_payload(*bits):
+    payload = bytearray(110)
+    for bit in bits:
+        payload[bit // 8] |= 1 << (bit % 8)
+    return bytes(payload)
 
 
 class Client:
@@ -94,14 +102,33 @@ def rsp_value():
     return base64.b64decode(msg["value"])
 
 
+def rsp_packet(cmd=None):
+    while True:
+        raw = rsp_value()
+        actual_cmd, length, _counter = struct.unpack_from("<HHB", raw)
+        assert length == len(raw) - 5, raw.hex()
+        if cmd is None or actual_cmd == cmd:
+            return raw
+
+
 # AUTH 0x0001 -> echo "NIRVA", same counter
 write_cmd(pkt(0x0001, 7, b"NIRVA"))
 rsp = rsp_value()
 assert rsp == pkt(0x0001, 7, b"NIRVA"), rsp.hex()
 
-# STREAMING 0x0010 [01] -> ack [01], then 0x0102 packets on DSS
-write_cmd(pkt(0x0010, 8, b"\x01"))
-assert rsp_value() == pkt(0x0010, 8, b"\x01")
+# QUERY_PARAMS 0x0201 -> full unified payload; QUERY_FW_VER mask -> 0x0202 text.
+write_cmd(pkt(0x0201, 10))
+status = rsp_packet(0x0201)
+assert len(status) == 5 + 110 and status[5 + 88] == 1, status.hex()
+
+write_cmd(pkt(0x0202, 11, unified_payload(23)))
+version = rsp_packet(0x0202)
+assert b"impossible-mock" in version[5:], version
+assert rsp_packet(0x0202) == pkt(0x0202, 11)
+
+# START_LC3 0x0202 mask bit 11 -> empty 0x0202 ack, then 0x0102 packets on DSS.
+write_cmd(pkt(0x0202, 8, unified_payload(11)))
+assert rsp_packet(0x0202) == pkt(0x0202, 8)
 
 frames = []
 while len(frames) < 20:
@@ -114,20 +141,36 @@ for i, f in enumerate(frames):
     assert counter == frames[0][4] + i, "counter gap"
     assert f[5] in (0x01, 0x02) and f[5] != frames[i - 1][5] if i else True, "tag"
 
-# LIST 0x000E -> 0x010E pages ("name,size\n") + empty terminator
-write_cmd(pkt(0x000E, 20))
-page = rsp_value()
-assert page[:2] == b"\x0e\x01" and page[4] == 20, page.hex()
+# STOP_LC3 before SEND, matching the app drain sequence.
+write_cmd(pkt(0x0202, 9, unified_payload(12)))
+assert rsp_packet(0x0202) == pkt(0x0202, 9)
+deadline = time.time() + 1
+tail = 0
+while time.time() < deadline:
+    try:
+        msg = c.recv(deadline)
+        if msg.get("type") == "didUpdateValue" and msg.get("characteristicId") == chars[DSS_DATA]:
+            tail += 1
+    except TimeoutError:
+        break
+assert tail <= 5, f"stream did not stop ({tail} extra frames)"
+
+# LIST 0x0202 QUERY_LFS_FILES mask bit 9 -> legacy action 0x0093 page.
+write_cmd(pkt(0x0202, 20, unified_payload(9)))
+page = rsp_packet(0x0093)
+assert page[4] == 20, page.hex()
 lines = page[5:].decode().strip().split("\n")
 files = [tuple(l.split(",")) for l in lines]
 assert all(n.startswith("lc3_") and n.endswith(".bin") for n, _ in files), files
-term = rsp_value()
-assert term == pkt(0x010E, 20), term.hex()
+assert rsp_packet(0x0202) == pkt(0x0202, 20)
 
-# SEND 0x000F -> 0x010F [size u32][chunks u32], then raw DSS frames on DSS char
+# SEND 0x0202 SEND_LC3_DUMP mask bit 13 -> 0x0202 ack, 0x010F plan,
+# then raw DSS frames on DSS char. The unified command carries no filename;
+# the mock sends the oldest file it advertised above.
 name, size = files[0]
-write_cmd(pkt(0x000F, 21, name.encode()))
-plan = rsp_value()
+write_cmd(pkt(0x0202, 21, unified_payload(13)))
+assert rsp_packet(0x0202)[5:] == b"\x01"
+plan = rsp_packet(0x010F)
 assert plan[:2] == b"\x0f\x01", plan.hex()
 total_size, chunk_count = struct.unpack_from("<II", plan, 5)
 assert total_size == int(size) and chunk_count > 2, (total_size, size, chunk_count)
@@ -145,7 +188,12 @@ def crc16(data):
 dss = []
 wire_bytes = 0
 while len(dss) < chunk_count:
-    msg = c.wait_for("didUpdateValue", characteristicId=chars[DSS_DATA])
+    if not dss:
+        msg = c.recv()
+        assert msg.get("type") == "didUpdateValue", msg
+        assert msg.get("characteristicId") == chars[DSS_DATA], msg
+    else:
+        msg = c.wait_for("didUpdateValue", characteristicId=chars[DSS_DATA])
     f = base64.b64decode(msg["value"])
     seq, ts, dtype = struct.unpack_from("<HIB", f)
     assert seq == len(dss), (seq, len(dss))                    # contiguous from 0
@@ -161,19 +209,6 @@ assert wire_bytes == total_size, (wire_bytes, total_size)
 # Unknown file -> plan [0][0]
 write_cmd(pkt(0x000F, 22, b"lc3_9999.bin"))
 assert rsp_value() == pkt(0x010F, 22, struct.pack("<II", 0, 0))
-
-# STREAMING 0x0010 [00] -> ack, stream stops
-write_cmd(pkt(0x0010, 9, b"\x00"))
-deadline = time.time() + 1
-tail = 0
-while time.time() < deadline:
-    try:
-        msg = c.recv(deadline)
-        if msg.get("type") == "didUpdateValue" and msg.get("characteristicId") == chars[DSS_DATA]:
-            tail += 1
-    except TimeoutError:
-        break
-assert tail <= 5, f"stream did not stop ({tail} extra frames)"
 
 print(f"OK: auth echo + {len(frames)} audio pkts + LIST {len(files)} files + "
       f"drain {name} ({chunk_count} DSS frames, {wire_bytes}B, CRC/seq valid), stream stops on disable")
